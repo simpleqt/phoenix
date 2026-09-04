@@ -664,6 +664,7 @@ def _lifespan(
     online_eval_producer: Optional[OnlineEvalProducer] = None,
     online_eval_consumer: Optional[OnlineEvalConsumer] = None,
     online_eval_session_consumer: Optional[OnlineEvalConsumer] = None,
+    online_eval_trace_consumer: Optional[OnlineEvalConsumer] = None,
     online_eval_session_sweeper: Optional[EvalSweeper] = None,
     online_eval_trace_sweeper: Optional[EvalSweeper] = None,
     token_store: Optional[TokenStore] = None,
@@ -726,12 +727,14 @@ def _lifespan(
             # shutdown snapshot would leak a provider session past the daemon.
             await stack.enter_async_context(sandbox_session_manager)
             await stack.enter_async_context(experiment_runner)
-            # Teardown stops the sweeper and producer before both consumers,
+            # Teardown stops the sweepers and producer before every consumer,
             # and all online-eval components before the sandbox manager.
             if online_eval_consumer is not None:
                 await stack.enter_async_context(online_eval_consumer)
             if online_eval_session_consumer is not None:
                 await stack.enter_async_context(online_eval_session_consumer)
+            if online_eval_trace_consumer is not None:
+                await stack.enter_async_context(online_eval_trace_consumer)
             if online_eval_producer is not None:
                 await stack.enter_async_context(online_eval_producer)
             if online_eval_session_sweeper is not None:
@@ -1100,6 +1103,7 @@ def create_app(
     online_eval_producer: Optional[OnlineEvalProducer] = None
     online_eval_consumer: Optional[OnlineEvalConsumer] = None
     online_eval_session_consumer: Optional[OnlineEvalConsumer] = None
+    online_eval_trace_consumer: Optional[OnlineEvalConsumer] = None
     online_eval_session_sweeper: Optional[EvalSweeper] = None
     online_eval_trace_sweeper: Optional[EvalSweeper] = None
     if not read_only:
@@ -1142,11 +1146,7 @@ def create_app(
             tracer_factory=lambda: Tracer(span_cost_calculator=span_cost_calculator),
         )
         # A consumer without its sweeper would claim from a table only the sweeper
-        # can fill, so the session halves start together. The trace sweeper below is
-        # the deliberate exception: it runs ahead of its consumer, and until that
-        # consumer lands the sweeper's admission ceiling is the only bound on the
-        # work it materializes. Nothing sheds a pending trace unit before a consumer
-        # claims it: the pending TTL applies to span work alone.
+        # can fill, so each target's two halves start together.
         online_eval_session_consumer = OnlineEvalConsumer(
             db,
             decrypt=encryption_service.decrypt,
@@ -1154,6 +1154,19 @@ def create_app(
             sandbox_runtime=sandbox_runtime,
             event_queue=dml_event_handler,
             evaluation_target="SESSION",
+            tick_interval_seconds=tick_interval_seconds,
+            claim_batch_size=claim_batch_size,
+            evaluator_semaphore=evaluator_semaphore,
+            db_semaphore=db_semaphore,
+            tracer_factory=lambda: Tracer(span_cost_calculator=span_cost_calculator),
+        )
+        online_eval_trace_consumer = OnlineEvalConsumer(
+            db,
+            decrypt=encryption_service.decrypt,
+            sandbox_session_manager=sandbox_session_manager,
+            sandbox_runtime=sandbox_runtime,
+            event_queue=dml_event_handler,
+            evaluation_target="TRACE",
             tick_interval_seconds=tick_interval_seconds,
             claim_batch_size=claim_batch_size,
             evaluator_semaphore=evaluator_semaphore,
@@ -1224,6 +1237,7 @@ def create_app(
             online_eval_producer=online_eval_producer,
             online_eval_consumer=online_eval_consumer,
             online_eval_session_consumer=online_eval_session_consumer,
+            online_eval_trace_consumer=online_eval_trace_consumer,
             online_eval_session_sweeper=online_eval_session_sweeper,
             online_eval_trace_sweeper=online_eval_trace_sweeper,
             grpc_interceptors=grpc_interceptors,
@@ -1448,6 +1462,7 @@ def create_app(
     app.state.online_eval_producer = online_eval_producer
     app.state.online_eval_consumer = online_eval_consumer
     app.state.online_eval_session_consumer = online_eval_session_consumer
+    app.state.online_eval_trace_consumer = online_eval_trace_consumer
     app.state.online_eval_session_sweeper = online_eval_session_sweeper
     app.state.online_eval_trace_sweeper = online_eval_trace_sweeper
     app.state.graphql_schema = graphql_schema
